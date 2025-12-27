@@ -1,9 +1,6 @@
-
 import React, { useState, useEffect, useMemo, useRef } from "react";
 import { createRoot } from "react-dom/client";
 import { GoogleGenAI } from "@google/genai";
-import { jsPDF } from "jspdf";
-import "jspdf-autotable";
 import {
   TrendingUp,
   TrendingDown,
@@ -16,6 +13,9 @@ import {
   RefreshCw,
   Upload,
   HardDrive,
+  Cloud,
+  CloudOff,
+  CloudCheck,
   UserPlus,
   User,
   Users,
@@ -40,11 +40,7 @@ import {
   Share2,
   Database,
   Layers,
-  Key,
-  FileText,
-  Radio,
-  Wifi,
-  WifiOff
+  Key
 } from "lucide-react";
 import {
   XAxis,
@@ -56,20 +52,15 @@ import {
   Area
 } from "recharts";
 
-// Объявляем глобальный тип для доступа к Pusher из window
-declare global {
-  interface Window {
-    pusherSync?: any; // Это позволит TypeScript видеть window.pusherSync
-  }
-}
-
 // Глобальные объявления для сборщика
 declare global {
   const gapi: any;
   const google: any;
   const __API_KEY__: string;
+  interface Window {
+    pusherSync: any;
+  }
 }
-
 
 // --- Types & Constants ---
 
@@ -87,7 +78,7 @@ interface UserAccount {
   password: string; 
   nickname: string;
   role: Role;
-  locationIds: string[]; 
+  locationIds: string[]; // Поддержка нескольких локаций
 }
 
 interface Transaction {
@@ -132,8 +123,13 @@ const SEED_FOUNDER: UserAccount = {
   password: "1234",
   nickname: "Основатель",
   role: "FOUNDER",
-  locationIds: [], 
+  locationIds: [], // Основатель видит всё
 };
+
+const DRIVE_FILE_NAME = "aptoria_finance_cloud_v1.json";
+
+// --- Google Auth Config ---
+const GOOGLE_CLIENT_ID = "86162384918-placeholder.apps.googleusercontent.com"; 
 
 // --- Storage Helpers ---
 
@@ -154,6 +150,28 @@ const storage = {
       console.error("Storage write error", e);
     }
   },
+};
+
+// --- Pusher Sync Helper ---
+const syncWithPusher = async (eventType: string, data: any, options?: { forceFullSync?: boolean }) => {
+  if (!window.pusherSync?.isInitialized || !window.pusherSync.isConnected) {
+    console.warn('Pusher not available for sync');
+    return false;
+  }
+
+  try {
+    if (options?.forceFullSync) {
+      await window.pusherSync.sendFullSync();
+      console.log('✅ Full sync sent to Pusher');
+    } else {
+      await window.pusherSync.sendDataUpdate(eventType, data);
+      console.log(`✅ ${eventType} sync sent to Pusher`);
+    }
+    return true;
+  } catch (error) {
+    console.error('Pusher sync error:', error);
+    return false;
+  }
 };
 
 // --- Global Date Helpers ---
@@ -193,35 +211,6 @@ const downloadCSV = (data: any[], filename: string) => {
   document.body.removeChild(link);
 };
 
-// --- PDF Export helper ---
-const exportToPDF = (transactions: Transaction[], locations: Location[], title: string) => {
-  const doc = new jsPDF() as any;
-  doc.setFontSize(20);
-  doc.text(title, 14, 22);
-  doc.setFontSize(11);
-  doc.text(`Отчет сформирован: ${new Date().toLocaleString()}`, 14, 30);
-
-  const tableData = transactions.map(t => [
-    t.date,
-    t.time,
-    locations.find(l => l.id === t.locationId)?.name || '-',
-    t.type === 'INCOME' ? 'Доход' : 'Расход',
-    t.category,
-    `${t.amount.toLocaleString()} р.`,
-    t.userNickname
-  ]);
-
-  doc.autoTable({
-    head: [['Дата', 'Время', 'Локация', 'Тип', 'Категория', 'Сумма', 'Сотрудник']],
-    body: tableData,
-    startY: 40,
-    styles: { fontSize: 8 },
-    headStyles: { fillColor: [79, 70, 229] }
-  });
-
-  doc.save(`Aptoria_Report_${new Date().toISOString().split('T')[0]}.pdf`);
-};
-
 // --- UI Components ---
 
 const Button = ({ children, onClick, variant = "primary", className = "", icon: Icon, disabled = false, loading = false, type = "button" }: any) => {
@@ -231,6 +220,7 @@ const Button = ({ children, onClick, variant = "primary", className = "", icon: 
     secondary: "bg-white text-slate-700 border border-slate-200 hover:bg-slate-50",
     danger: "bg-red-500 text-white hover:bg-red-600 shadow-md shadow-red-100",
     ghost: "bg-transparent text-slate-500 hover:bg-slate-100",
+    google: "bg-white text-slate-700 border border-slate-200 hover:bg-slate-50 shadow-sm",
   };
   return (
     <button type={type} disabled={disabled || loading} onClick={onClick} className={`${base} ${variants[variant]} ${className}`}>
@@ -265,9 +255,13 @@ function App() {
   const [categories, setCategories] = useState<CategoryMap>(storage.get("categories") || {});
   const [currentTab, setCurrentTab] = useState<"dashboard" | "transactions" | "settings">("dashboard");
   const [rememberMe, setRememberMe] = useState<boolean>(storage.get("rememberMe") || false);
-  const [pusherStatus, setPusherStatus] = useState<string>(window.pusherSync?.status || 'disconnected');
+  const [syncStatus, setSyncStatus] = useState<"synced" | "syncing" | "error" | "offline">("synced");
 
   const [showAddTransaction, setShowAddTransaction] = useState(false);
+  const [googleDriveConnected, setGoogleDriveConnected] = useState<boolean>(storage.get("driveConnected") || false);
+
+  const tokenClient = useRef<any>(null);
+  const gapiInited = useRef(false);
 
   // Filtering
   const [filterType, setFilterType] = useState<FilterType>("7days");
@@ -278,65 +272,175 @@ function App() {
   const [password, setPassword] = useState("");
   const [loginError, setLoginError] = useState("");
 
-  // Persist to local storage
-  useEffect(() => {
-  const timer = setTimeout(() => {
-    // Сохраняем в localStorage
-    storage.set("user", currentUser);
-    storage.set("users", users);
-    storage.set("locations", locations);
-    storage.set("transactions", transactions);
-    storage.set("categories", categories);
-    storage.set("rememberMe", rememberMe);
-    
-    // Отправляем изменения через Pusher (только если Pusher инициализирован)
-    if (window.pusherSync?.isInitialized) {
-      // Отправляем полную синхронизацию каждые 30 секунд или по требованию
-      // Для отдельных изменений добавьте отправку в соответствующие функции
-      // Пока просто сохраняем, отправка будет по кнопке в настройках
-    }
-  }, 2000);
-  return () => clearTimeout(timer);
-}, [currentUser, users, locations, transactions, categories, rememberMe]);
+  // --- Google Drive Logic ---
 
-  // Pusher status and real-time updates listener
-  useEffect(() => {
-    const handlePusherUpdate = (event: CustomEvent) => {
-      const data = event.detail;
-      console.log('Pusher update received:', data);
+  const handleDriveSync = async () => {
+    if (!googleDriveConnected || !gapiInited.current) return;
+    setSyncStatus("syncing");
+    
+    try {
+      const token = gapi.client.getToken();
+      if (!token) {
+        setSyncStatus("offline");
+        return;
+      }
+
+      const data = { users, locations, transactions, categories, lastUpdated: Date.now() };
       
-      switch(data.type) {
-        case 'storage-update':
-          const { key, value } = data.payload;
-          if (key === 'aptoria_transactions') {
-            setTransactions(value);
-          } else if (key === 'aptoria_users') {
-            setUsers(value);
-          } else if (key === 'aptoria_locations') {
-            setLocations(value);
-          } else if (key === 'aptoria_categories') {
-            setCategories(value);
-          }
-          break;
-        case 'full-sync':
-          if (confirm('Получены обновленные данные. Загрузить?')) {
-            location.reload();
-          }
-          break;
+      const response = await gapi.client.drive.files.list({
+        q: `name = '${DRIVE_FILE_NAME}' and trashed = false`,
+        fields: 'files(id, name)',
+      });
+      
+      const files = response.result.files;
+      let fileId = files && files.length > 0 ? files[0].id : null;
+      
+      if (!fileId) {
+        const metadata = { name: DRIVE_FILE_NAME, mimeType: 'application/json' };
+        const content = JSON.stringify(data);
+        const boundary = '-------314159265358979323846';
+        const delimiter = "\r\n--" + boundary + "\r\n";
+        const close_delim = "\r\n--" + boundary + "--";
+
+        const multipartRequestBody =
+            delimiter +
+            'Content-Type: application/json\r\n\r\n' +
+            JSON.stringify(metadata) +
+            delimiter +
+            'Content-Type: application/json\r\n\r\n' +
+            content +
+            close_delim;
+
+        await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart', {
+            method: 'POST',
+            headers: {
+                'Authorization': 'Bearer ' + token.access_token,
+                'Content-Type': 'multipart/related; boundary=' + boundary
+            },
+            body: multipartRequestBody
+        });
+      } else {
+        await gapi.client.request({
+            path: `/upload/drive/v3/files/${fileId}`,
+            method: 'PATCH',
+            params: { uploadType: 'media' },
+            body: JSON.stringify(data)
+        });
+      }
+      setSyncStatus("synced");
+    } catch (e) {
+      console.error("Drive sync error:", e);
+      setSyncStatus("error");
+    }
+  };
+
+  const connectGoogleDrive = () => {
+    if (!tokenClient.current) {
+      alert("Библиотеки Google еще загружаются. Пожалуйста, подождите.");
+      return;
+    }
+    
+    tokenClient.current.callback = async (resp: any) => {
+      if (resp.error) {
+        console.error("Auth error:", resp.error);
+        return;
+      }
+      
+      setGoogleDriveConnected(true);
+      storage.set("driveConnected", true);
+      
+      try {
+        setSyncStatus("syncing");
+        const listResp = await gapi.client.drive.files.list({
+            q: `name = '${DRIVE_FILE_NAME}' and trashed = false`,
+            fields: 'files(id, name)',
+        });
+        
+        const files = listResp.result.files;
+        if (files && files.length > 0) {
+            const fileId = files[0].id;
+            const contentResp = await gapi.client.drive.files.get({
+                fileId: fileId,
+                alt: 'media'
+            });
+            
+            const cloudData = contentResp.result;
+            if (confirm("Облачная копия найдена. Загрузить данные из Google Drive? Текущие данные будут заменены.")) {
+                if(cloudData.users) setUsers(cloudData.users);
+                if(cloudData.locations) setLocations(cloudData.locations);
+                if(cloudData.transactions) setTransactions(cloudData.transactions);
+                if(cloudData.categories) setCategories(cloudData.categories);
+                setSyncStatus("synced");
+            }
+        } else {
+            handleDriveSync();
+        }
+      } catch (err) {
+        console.error("Initial load error:", err);
+        setSyncStatus("error");
+      }
+    };
+    
+    tokenClient.current.requestAccessToken({ prompt: 'consent' });
+  };
+
+  // Автоматическая синхронизация с Pusher при изменениях данных
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      // Сохраняем в localStorage
+      storage.set("user", currentUser);
+      storage.set("users", users);
+      storage.set("locations", locations);
+      storage.set("transactions", transactions);
+      storage.set("categories", categories);
+      storage.set("rememberMe", rememberMe);
+      
+      // АВТОМАТИЧЕСКАЯ СИНХРОНИЗАЦИЯ С PUSHER
+      if (window.pusherSync?.isInitialized && window.pusherSync.isConnected) {
+        syncWithPusher('app-data-updated', {
+          users: users,
+          locations: locations,
+          transactions: transactions,
+          categories: categories,
+          timestamp: Date.now()
+        }).catch(err => console.error('Pusher send error:', err));
+      }
+      
+      if (googleDriveConnected) handleDriveSync();
+    }, 1000); // Уменьшили задержку до 1 секунды
+    
+    return () => clearTimeout(timer);
+  }, [currentUser, users, locations, transactions, categories, rememberMe, googleDriveConnected]);
+
+  useEffect(() => {
+    const initGapi = async () => {
+      try {
+        await new Promise((resolve) => gapi.load('client', resolve));
+        await gapi.client.init({
+          discoveryDocs: ["https://www.googleapis.com/discovery/v1/apis/drive/v3/rest"],
+        });
+        gapiInited.current = true;
+      } catch (e) {
+        console.error("GAPI init failed:", e);
       }
     };
 
-    const handleStatusChange = (event: CustomEvent) => {
-      setPusherStatus(event.detail.status);
+    const initGis = () => {
+      try {
+        tokenClient.current = google.accounts.oauth2.initTokenClient({
+          client_id: GOOGLE_CLIENT_ID,
+          scope: 'https://www.googleapis.com/auth/drive.file',
+          callback: '', 
+        });
+      } catch (e) {
+        console.error("GIS init failed:", e);
+      }
     };
-    
-    window.addEventListener('pusher-data-update', handlePusherUpdate as EventListener);
-    window.addEventListener('pusher-status-change', handleStatusChange as EventListener);
-    
-    return () => {
-      window.removeEventListener('pusher-data-update', handlePusherUpdate as EventListener);
-      window.removeEventListener('pusher-status-change', handleStatusChange as EventListener);
-    };
+
+    if (typeof gapi !== 'undefined' && typeof google !== 'undefined') {
+        initGapi();
+        initGis();
+    }
   }, []);
 
   const handleLogin = () => {
@@ -344,12 +448,25 @@ function App() {
     if (user) {
       setCurrentUser(user);
       setLoginError("");
+      // Синхронизация входа пользователя
+      syncWithPusher('user-logged-in', {
+        userId: user.id,
+        userNickname: user.nickname,
+        timestamp: Date.now()
+      });
     } else {
       setLoginError("Неверный логин или пароль");
     }
   };
 
   const handleLogout = () => {
+    // Синхронизация выхода пользователя
+    if (currentUser) {
+      syncWithPusher('user-logged-out', {
+        userId: currentUser.id,
+        timestamp: Date.now()
+      });
+    }
     setCurrentUser(null);
     if (!rememberMe) {
       setEmail("");
@@ -357,54 +474,6 @@ function App() {
     }
     setCurrentTab("dashboard");
   };
-  
-  // Слушаем события от Pusher для обновления данных в реальном времени
-useEffect(() => {
-  const handlePusherUpdate = (event: CustomEvent) => {
-    const data = event.detail;
-    console.log('Pusher update received:', data);
-    
-    switch(data.type) {
-      case 'storage-update':
-        // Обновляем конкретное хранилище
-        if (data.payload.key === 'aptoria_transactions') {
-          setTransactions(data.payload.value);
-        } else if (data.payload.key === 'aptoria_users') {
-          setUsers(data.payload.value);
-        } else if (data.payload.key === 'aptoria_locations') {
-          setLocations(data.payload.value);
-        } else if (data.payload.key === 'aptoria_categories') {
-          setCategories(data.payload.value);
-        }
-        // ... и так далее для других ключей
-        break;
-        
-      case 'full-sync':
-        // Предлагаем пользователю загрузить новые данные
-        if (confirm('Получены обновленные данные из облака. Загрузить?')) {
-          // Обновляем все данные
-          if (data.payload.users) setUsers(data.payload.users);
-          if (data.payload.transactions) setTransactions(data.payload.transactions);
-          if (data.payload.locations) setLocations(data.payload.locations);
-          if (data.payload.categories) setCategories(data.payload.categories);
-          
-          // Показываем сообщение об успехе
-          setTimeout(() => {
-            alert('Данные успешно обновлены!');
-          }, 500);
-        }
-        break;
-    }
-  };
-  
-  // Подписываемся на событие
-  window.addEventListener('pusher-data-update', handlePusherUpdate as EventListener);
-  
-  // Очищаем подписку при размонтировании
-  return () => {
-    window.removeEventListener('pusher-data-update', handlePusherUpdate as EventListener);
-  };
-}, []); // Пустой массив зависимостей - запускается один раз при монтировании
 
   if (!currentUser) {
     return (
@@ -415,7 +484,7 @@ useEffect(() => {
               <Cpu className="text-white" size={32} />
             </div>
             <h1 className="text-2xl font-bold text-white">Aptoria IT</h1>
-            <p className="text-slate-400 font-medium">Разработано в Екатеринбурге</p>
+            <p className="text-slate-400">Управление финансами сети</p>
           </div>
           <div className="bg-white rounded-3xl p-8 shadow-2xl">
             <div className="space-y-4">
@@ -467,19 +536,11 @@ useEffect(() => {
     <div className="min-h-screen bg-slate-50 pb-24 md:pb-0 md:pl-64">
       {/* Sidebar Desktop */}
       <aside className="hidden md:flex flex-col fixed left-0 top-0 bottom-0 w-64 bg-slate-900 border-r border-slate-800 p-4 z-50">
-        <div className="flex items-center justify-between px-2 mb-8">
-          <div className="flex items-center gap-3">
-            <div className="bg-indigo-600 p-2 rounded-lg text-white">
-              <Cpu size={20} />
-            </div>
-            <span className="font-bold text-xl text-white tracking-tight">Aptoria IT</span>
+        <div className="flex items-center gap-3 px-2 mb-8">
+          <div className="bg-indigo-600 p-2 rounded-lg text-white">
+            <Cpu size={20} />
           </div>
-          <div className="group relative">
-             <div className={`w-3 h-3 rounded-full ${pusherStatus === 'connected' ? 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.8)]' : 'bg-rose-500 shadow-[0_0_8px_rgba(239,68,68,0.8)]'}`} />
-             <div className="absolute left-full ml-2 top-1/2 -translate-y-1/2 px-2 py-1 bg-slate-800 text-white text-[10px] rounded opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap z-50">
-                Pusher: {pusherStatus === 'connected' ? 'Подключено' : 'Офлайн'}
-             </div>
-          </div>
+          <span className="font-bold text-xl text-white tracking-tight">Aptoria IT</span>
         </div>
 
         <nav className="flex-1 space-y-1">
@@ -489,6 +550,15 @@ useEffect(() => {
         </nav>
 
         <div className="pt-4 border-t border-slate-800 space-y-4">
+          <div className="flex items-center justify-between px-3 text-[10px] uppercase font-bold text-slate-500">
+            <span className="flex items-center gap-1.5">{googleDriveConnected ? <CloudCheck size={12} className="text-emerald-400"/> : <CloudOff size={12}/>} Drive Sync</span>
+            <div className="flex items-center gap-1.5">
+              <div className={`w-2 h-2 rounded-full ${syncStatus === 'synced' ? 'bg-emerald-500 shadow-[0_0_8px_#10b981]' : syncStatus === 'error' ? 'bg-rose-500' : 'bg-amber-500 animate-pulse'}`} />
+              <span className={syncStatus === 'synced' ? 'text-emerald-500' : syncStatus === 'error' ? 'text-rose-500' : 'text-amber-500'}>
+                {syncStatus === 'synced' ? 'Ок' : syncStatus === 'error' ? 'Ошибка' : 'Обмен...' }
+              </span>
+            </div>
+          </div>
           <div className="px-3 py-3 rounded-xl bg-slate-800/50">
             <div className="flex items-center gap-3">
               <div className="w-8 h-8 rounded-full bg-indigo-500 flex items-center justify-center text-white font-bold">
@@ -510,10 +580,7 @@ useEffect(() => {
       <nav className="md:hidden fixed bottom-0 left-0 right-0 bg-white border-t border-slate-200 z-[100] flex justify-around items-center p-3 shadow-[0_-4px_20px_rgba(0,0,0,0.05)]">
           <MobileNavItem active={currentTab === "dashboard"} onClick={() => setCurrentTab("dashboard")} icon={TrendingUp} />
           <MobileNavItem active={currentTab === "transactions"} onClick={() => setCurrentTab("transactions")} icon={Hash} />
-          <div className="relative">
-            <MobileNavItem active={currentTab === "settings"} onClick={() => setCurrentTab("settings")} icon={Settings} />
-            <div className={`absolute top-0 right-0 w-3 h-3 rounded-full border-2 border-white ${pusherStatus === 'connected' ? 'bg-emerald-500' : 'bg-rose-500'}`} />
-          </div>
+          <MobileNavItem active={currentTab === "settings"} onClick={() => setCurrentTab("settings")} icon={Settings} />
           <button onClick={handleLogout} className="p-2 text-rose-500 opacity-60"><LogOut size={24}/></button>
       </nav>
 
@@ -562,7 +629,7 @@ useEffect(() => {
         {currentTab === "transactions" && (
           <TransactionsView 
             transactions={transactions} 
-            setTransactions={(val: any) => { setTransactions(val); window.pusherSync?.syncData('aptoria_transactions', val); }} 
+            setTransactions={setTransactions} 
             locations={locations} 
             categories={categories}
             currentUser={currentUser}
@@ -577,16 +644,18 @@ useEffect(() => {
         {currentTab === "settings" && (
           <SettingsView 
             currentUser={currentUser} 
-            setCurrentUser={(val: any) => { setCurrentUser(val); }}
+            setCurrentUser={setCurrentUser}
             locations={locations} 
-            setLocations={(val: any) => { setLocations(val); window.pusherSync?.syncData('aptoria_locations', val); }}
+            setLocations={setLocations}
             categories={categories}
-            setCategories={(val: any) => { setCategories(val); window.pusherSync?.syncData('aptoria_categories', val); }}
+            setCategories={setCategories}
             users={users}
-            setUsers={(val: any) => { setUsers(val); window.pusherSync?.syncData('aptoria_users', val); }}
+            setUsers={setUsers}
             transactions={transactions}
-            setTransactions={(val: any) => { setTransactions(val); window.pusherSync?.syncData('aptoria_transactions', val); }}
-            pusherStatus={pusherStatus}
+            setTransactions={setTransactions}
+            googleDriveConnected={googleDriveConnected}
+            setGoogleDriveConnected={setGoogleDriveConnected}
+            connectGoogleDrive={connectGoogleDrive}
           />
         )}
       </main>
@@ -596,7 +665,7 @@ useEffect(() => {
         <div className="fixed inset-0 z-[120]">
            <TransactionsView 
                 transactions={transactions} 
-                setTransactions={(val: any) => { setTransactions(val); window.pusherSync?.syncData('aptoria_transactions', val); }} 
+                setTransactions={setTransactions} 
                 locations={locations} 
                 categories={categories}
                 currentUser={currentUser}
@@ -620,6 +689,7 @@ function DashboardView({ transactions, locations, currentUser, filterType, start
   const [aiReport, setAiReport] = useState("");
   const [isAiLoading, setIsAiLoading] = useState(false);
   
+  // Доступные для текущего пользователя локации
   const availableLocations = useMemo(() => {
     if (currentUser.role === 'FOUNDER') return locations;
     return locations.filter((l: any) => currentUser.locationIds.includes(l.id));
@@ -720,7 +790,15 @@ function DashboardView({ transactions, locations, currentUser, filterType, start
     setIsAiLoading(true);
     setAiReport("");
     try {
-      const ai = new GoogleGenAI({ apiKey: __API_KEY__ });
+      const apiKey = __API_KEY__;
+      
+      if (!apiKey || apiKey === '') {
+        setAiReport("API ключ не настроен. Пожалуйста, добавьте API_KEY в настройки окружения.");
+        setIsAiLoading(false);
+        return;
+      }
+
+      const ai = new GoogleGenAI({ apiKey });
       const prompt = `Проведи финансовый аудит для сети сервисных центров Aptoria. Данные периода: доход ${stats.income}, расход ${stats.expense}, рентабельность ${stats.profitability}%. Детализация: ${JSON.stringify(categoryStats)}. Дай 3 конкретных совета.`;
       const response = await ai.models.generateContent({ 
         model: 'gemini-3-flash-preview', 
@@ -729,7 +807,7 @@ function DashboardView({ transactions, locations, currentUser, filterType, start
       setAiReport(response.text || "Ошибка анализа");
     } catch (e) {
       console.error("AI Error:", e);
-      setAiReport("Ошибка ИИ: Проверьте ключ API.");
+      setAiReport("Ошибка ИИ: Проверьте подключение к интернету и ключ API.");
     } finally {
       setIsAiLoading(false);
     }
@@ -749,7 +827,6 @@ function DashboardView({ transactions, locations, currentUser, filterType, start
               {availableLocations.map((l: any) => <option key={l.id} value={l.id}>{l.name}</option>)}
           </select>
           <Button variant="secondary" onClick={handleExportAnalytics} icon={Download}>CSV</Button>
-          <Button variant="secondary" onClick={() => exportToPDF(filteredTransactions, locations, "Aptoria IT Finance Analysis")} icon={FileText}>PDF</Button>
         </div>
       </div>
 
@@ -806,6 +883,7 @@ function TransactionsView({
 }: any) {
   const [details, setDetails] = useState<Transaction | null>(null);
   
+  // Доступные локации для текущего пользователя
   const availableLocations = useMemo(() => {
     if (currentUser.role === 'FOUNDER') return locations;
     return locations.filter((l: any) => currentUser.locationIds.includes(l.id));
@@ -826,9 +904,13 @@ function TransactionsView({
 
   const filteredList = useMemo(() => {
     let list = transactions;
+    
+    // Сначала фильтруем по тому, что пользователю вообще разрешено видеть
     if (currentUser.role !== 'FOUNDER') {
         list = list.filter((t: any) => currentUser.locationIds.includes(t.locationId));
     }
+    
+    // Затем применяем фильтры интерфейса
     if (filterLocation !== 'all') list = list.filter((t: any) => t.locationId === filterLocation);
     if (filterTypeT !== 'all') list = list.filter((t: any) => t.type === filterTypeT);
     if (filterResponsible !== 'all') list = list.filter((t: any) => t.userNickname === filterResponsible);
@@ -845,7 +927,7 @@ function TransactionsView({
     downloadCSV(data, `Transactions_Export_${new Date().toISOString().split('T')[0]}.csv`);
   };
 
-  const handleAdd = () => {
+  const handleAdd = async () => {
     const newErrors = [];
     if (!amount || Number(amount) <= 0) newErrors.push("amount");
     if (!category) newErrors.push("category");
@@ -867,8 +949,29 @@ function TransactionsView({
         locationId, comment, userId: currentUser.id, userNickname: currentUser.nickname,
         createdAt: Date.now()
     };
-    setTransactions([...transactions, newT]);
-    setShowAdd(false); setAmount(""); setComment(""); setCategory(""); setErrors([]);
+    
+    // 1. Обновляем состояние
+    const updatedTransactions = [...transactions, newT];
+    setTransactions(updatedTransactions);
+    
+    // 2. Сбрасываем форму
+    setShowAdd(false); 
+    setAmount(""); 
+    setComment(""); 
+    setCategory(""); 
+    setErrors([]);
+
+    // 3. СИНХРОНИЗИРУЕМ ЧЕРЕЗ PUSHER
+    const syncSuccess = await syncWithPusher('transaction-added', {
+      transaction: newT,
+      allTransactions: updatedTransactions,
+      userId: currentUser.id,
+      timestamp: Date.now()
+    });
+
+    if (!syncSuccess) {
+      console.warn('⚠️ Transaction saved locally but Pusher sync failed');
+    }
   };
 
   const currentCategories = useMemo(() => {
@@ -903,9 +1006,35 @@ function TransactionsView({
                 </select>
                 <div className="flex gap-2 w-full md:w-auto">
                     <Button variant="secondary" onClick={handleExportTransactions} icon={Download}>CSV</Button>
-                    <Button variant="secondary" onClick={() => exportToPDF(filteredList, locations, "Aptoria IT Finance Register")} icon={FileText}>PDF</Button>
                 </div>
                 </div>
+            </div>
+
+            <div className="hidden md:block">
+                <Card className="overflow-x-auto p-0">
+                    <table className="w-full text-left">
+                    <thead className="bg-slate-50 border-b border-slate-100">
+                        <tr>
+                        <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase">Время</th>
+                        <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase">Локация</th>
+                        <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase">Категория</th>
+                        <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase">Сумма</th>
+                        <th className="px-6 py-4 text-xs font-bold text-slate-500 uppercase text-right">Инфо</th>
+                        </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-50">
+                        {filteredList.map((t: any) => (
+                        <tr key={t.id} className="hover:bg-slate-50/50 transition-colors">
+                            <td className="px-6 py-4 text-xs text-slate-600 font-bold">{t.date}<br/>{t.time}</td>
+                            <td className="px-6 py-4 text-sm text-slate-900 font-medium">{locations.find((l: any) => l.id === t.locationId)?.name || '-'}</td>
+                            <td className="px-6 py-4"><span className={`px-2 py-1 rounded-md text-[10px] font-black ${t.type === 'INCOME' ? 'bg-emerald-50 text-emerald-700' : 'bg-rose-50 text-rose-700'}`}>{t.category}</span></td>
+                            <td className={`px-6 py-4 text-sm font-black ${t.type === 'INCOME' ? 'text-emerald-600' : 'text-rose-600'}`}>{t.type === 'INCOME' ? '+' : '-'}{t.amount.toLocaleString()} ₽</td>
+                            <td className="px-6 py-4 text-right"><button onClick={() => setDetails(t)} className="text-indigo-500 hover:text-indigo-700 p-2"><Eye size={18} /></button></td>
+                        </tr>
+                        ))}
+                    </tbody>
+                    </table>
+                </Card>
             </div>
 
             <div className="md:hidden space-y-3">
@@ -931,7 +1060,16 @@ function TransactionsView({
         </>
       )}
 
-      {details && <DetailsModal details={details} locations={locations} currentUser={currentUser} onClose={() => setDetails(null)} setTransactions={setTransactions} transactions={transactions} />}
+      {details && (
+        <DetailsModal 
+          details={details} 
+          locations={locations} 
+          currentUser={currentUser} 
+          onClose={() => setDetails(null)} 
+          setTransactions={setTransactions} 
+          transactions={transactions} 
+        />
+      )}
 
       {showAdd && (
         <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-[110] flex items-end md:items-center justify-center md:p-4">
@@ -969,13 +1107,23 @@ function TransactionsView({
           </Card>
         </div>
       )}
+
+      <style>{`
+        @keyframes shake {
+          0%, 100% { transform: translateX(0); }
+          25% { transform: translateX(-5px); }
+          50% { transform: translateX(5px); }
+          75% { transform: translateX(-5px); }
+        }
+        .animate-shake { animation: shake 0.4s ease-in-out; }
+      `}</style>
     </div>
   );
 }
 
 // --- Settings View ---
 
-function SettingsView({ currentUser, setCurrentUser, locations, setLocations, users, setUsers, transactions, setTransactions, categories, setCategories, pusherStatus }: any) {
+function SettingsView({ currentUser, setCurrentUser, locations, setLocations, users, setUsers, transactions, setTransactions, categories, setCategories, googleDriveConnected, setGoogleDriveConnected, connectGoogleDrive }: any) {
   const [activeSection, setActiveSection] = useState<"profile" | "locations" | "users" | "data" | "categories">("profile");
   const [showResetConfirm, setShowResetConfirm] = useState(false);
   const [isSureAboutReset, setIsSureAboutReset] = useState(false);
@@ -988,10 +1136,6 @@ function SettingsView({ currentUser, setCurrentUser, locations, setLocations, us
     link.href = url;
     link.download = `Aptoria_Backup_${new Date().toISOString().split('T')[0]}.json`;
     link.click();
-  };
-
-  const handleExportPDF = () => {
-    exportToPDF(transactions, locations, "Полный Архив Транзакций Aptoria IT");
   };
 
   const handleImportBackup = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -1007,10 +1151,33 @@ function SettingsView({ currentUser, setCurrentUser, locations, setLocations, us
                 if(data.transactions) setTransactions(data.transactions);
                 if(data.categories) setCategories(data.categories);
                 alert('Данные восстановлены!');
+                // Синхронизация после импорта
+                syncWithPusher('data-imported', {
+                  users: data.users || users,
+                  locations: data.locations || locations,
+                  transactions: data.transactions || transactions,
+                  categories: data.categories || categories,
+                  timestamp: Date.now()
+                }, { forceFullSync: true });
             }
         } catch(e) { alert('Ошибка чтения файла'); }
     };
     reader.readAsText(file);
+  };
+
+  const handleFullReset = async () => {
+    if (currentUser.role === 'FOUNDER' && isSureAboutReset) {
+        setTransactions([]);
+        setShowResetConfirm(false);
+        setIsSureAboutReset(false);
+        
+        // Синхронизация сброса транзакций
+        await syncWithPusher('transactions-reset', {
+          userId: currentUser.id,
+          timestamp: Date.now(),
+          allTransactions: []
+        });
+    }
   };
 
   return (
@@ -1037,47 +1204,74 @@ function SettingsView({ currentUser, setCurrentUser, locations, setLocations, us
         {activeSection === "data" && (
             <Card title="Управление данными" icon={Database}>
                 <div className="space-y-6">
-                    {currentUser.role === 'FOUNDER' && (
-                      <div className="p-4 bg-indigo-50 border border-indigo-100 rounded-2xl">
-                      <div className="flex items-center justify-between mb-2">
-    <h4 className="font-black text-indigo-800 text-sm uppercase">Pusher Синхронизация</h4>
-    <div className="px-2 py-0.5 rounded text-[10px] font-black uppercase bg-emerald-100 text-emerald-700">
-      Активно
-    </div>
-  </div>
-  <p className="text-xs text-indigo-600 mb-4 font-medium">
-    Синхронизируйте данные между всеми пользователями в реальном времени
-  </p>
-  <div className="space-y-2">
-    <Button 
-      onClick={() => window.pusherSync?.sendFullSync()} 
-      variant="primary" 
-      icon={RefreshCw}
-    >
-      Синхронизировать сейчас
-    </Button>
-    <Button 
-      onClick={() => window.pusherSync?.showStatus('Тест уведомления', 'info')} 
-      variant="secondary"
-    >
-      Тест уведомления
-    </Button>
-  </div>
-</div>
-                    )}
+                    <div className="p-4 bg-indigo-50 border border-indigo-100 rounded-2xl">
+                        <div className="flex items-center justify-between mb-2">
+                             <h4 className="font-black text-indigo-800 text-sm uppercase">Google Drive Облако</h4>
+                             <div className={`px-2 py-0.5 rounded text-[10px] font-black uppercase ${googleDriveConnected ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-200 text-slate-600'}`}>
+                                {googleDriveConnected ? 'Активно' : 'Выключено'}
+                             </div>
+                        </div>
+                        <p className="text-xs text-indigo-600 mb-4 font-medium">Синхронизируйте базу данных с вашим личным Google Диском.</p>
+                        {!googleDriveConnected ? (
+                            <Button onClick={connectGoogleDrive} variant="primary" icon={Cloud}>Подключить диск</Button>
+                        ) : (
+                            <div className="flex items-center justify-between">
+                                <div className="text-xs text-emerald-600 font-bold flex items-center gap-1"><Check size={14}/> Облако подключено</div>
+                                <Button variant="ghost" className="text-rose-500 text-[10px] px-2" onClick={() => { storage.set("driveConnected", false); setGoogleDriveConnected(false); location.reload(); }}>Отключить</Button>
+                            </div>
+                        )}
+                    </div>
                     <div className="p-4 bg-slate-50 border border-slate-100 rounded-2xl">
                         <h4 className="font-black text-slate-800 text-sm uppercase mb-2">Локальный бэкап</h4>
                         <div className="flex flex-wrap gap-2">
-                            <Button variant="secondary" onClick={handleExportBackup} icon={Download}>JSON Бэкап</Button>
-                            <Button variant="secondary" onClick={handleExportPDF} icon={FileText}>PDF Отчет</Button>
+                            <Button variant="secondary" onClick={handleExportBackup} icon={Download}>Скачать JSON</Button>
                             <label className="flex items-center gap-2 px-4 py-2 bg-white border border-slate-200 text-slate-700 rounded-xl font-medium cursor-pointer hover:bg-slate-50 transition-all">
                                 <Upload size={18}/>
-                                Восстановить JSON
+                                Восстановить
                                 <input type="file" accept=".json" className="hidden" onChange={handleImportBackup} />
                             </label>
                         </div>
                     </div>
+                    {currentUser.role === 'FOUNDER' && (
+                      <div className="p-4 bg-rose-50 border border-rose-100 rounded-2xl">
+                           <h4 className="font-black text-rose-800 text-sm uppercase mb-2">Опасная зона</h4>
+                           <p className="text-xs text-rose-600 mb-4 font-medium">Сброс всех записей о транзакциях сети.</p>
+                           <Button variant="danger" onClick={() => setShowResetConfirm(true)} icon={Trash2}>Сбросить журнал</Button>
+                      </div>
+                    )}
                 </div>
+
+                {showResetConfirm && (
+                    <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-md z-[200] flex items-center justify-center p-4 animate-in fade-in zoom-in-95 duration-200">
+                        <Card title="Подтверждение удаления" icon={AlertCircle} className="w-full max-w-sm border-rose-100 shadow-2xl">
+                            <div className="space-y-5">
+                                <div className="flex items-center gap-4 text-rose-600 bg-rose-50 p-4 rounded-xl">
+                                    <AlertCircle size={32} className="flex-shrink-0" />
+                                    <p className="text-xs font-bold leading-relaxed uppercase">
+                                        Внимание! Это действие удалит все транзакции сети без возможности восстановления.
+                                    </p>
+                                </div>
+                                
+                                <label className="flex items-start gap-3 p-4 border border-slate-100 rounded-xl bg-slate-50/50 cursor-pointer">
+                                    <input 
+                                        type="checkbox" 
+                                        className="mt-0.5 w-4 h-4 text-rose-600 border-slate-300 rounded focus:ring-rose-500" 
+                                        checked={isSureAboutReset}
+                                        onChange={(e) => setIsSureAboutReset(e.target.checked)}
+                                    />
+                                    <span className="text-xs text-slate-600 font-semibold select-none">
+                                        Я уверен в своем действии и понимаю, что данные будут удалены навсегда.
+                                    </span>
+                                </label>
+
+                                <div className="flex gap-3 pt-2">
+                                    <Button variant="secondary" className="flex-1" onClick={() => { setShowResetConfirm(false); setIsSureAboutReset(false); }}>Отмена</Button>
+                                    <Button variant="danger" className="flex-1" disabled={!isSureAboutReset} onClick={handleFullReset} icon={Trash2}>Подтвердить</Button>
+                                </div>
+                            </div>
+                        </Card>
+                    </div>
+                )}
             </Card>
         )}
       </div>
@@ -1143,9 +1337,20 @@ const DetailsModal = ({ details, locations, currentUser, onClose, setTransaction
                     </div>
                 )}
                 {(currentUser.role === 'FOUNDER' || currentUser.role === 'ADMIN') && (
-                    <Button variant="danger" className="w-full py-3" icon={Trash2} onClick={() => {
+                    <Button variant="danger" className="w-full py-3" icon={Trash2} onClick={async () => {
                         if(confirm('Удалить операцию?')) {
-                            setTransactions(transactions.filter((tx: any) => tx.id !== details.id));
+                            // 1. Удаляем из состояния
+                            const updatedTransactions = transactions.filter((tx: any) => tx.id !== details.id);
+                            setTransactions(updatedTransactions);
+                            
+                            // 2. Синхронизируем через Pusher
+                            await syncWithPusher('transaction-deleted', {
+                                transactionId: details.id,
+                                allTransactions: updatedTransactions,
+                                userId: currentUser.id,
+                                timestamp: Date.now()
+                            });
+                            
                             onClose();
                         }
                     }}>Удалить</Button>
@@ -1160,6 +1365,23 @@ const ProfileSection = ({ currentUser, setCurrentUser, setUsers, users }: any) =
     const [nick, setNick] = useState(currentUser.nickname);
     const [email, setEmail] = useState(currentUser.email);
     const [pass, setPass] = useState(currentUser.password);
+    
+    const handleSave = async () => {
+        const updatedUser = {...currentUser, nickname: nick, email, password: pass};
+        const updatedUsers = users.map((u: any) => u.id === currentUser.id ? updatedUser : u);
+        
+        setCurrentUser(updatedUser);
+        setUsers(updatedUsers);
+        setIsEditing(false);
+        
+        // Синхронизация изменений профиля
+        await syncWithPusher('user-profile-updated', {
+            user: updatedUser,
+            allUsers: updatedUsers,
+            timestamp: Date.now()
+        });
+    };
+    
     return (
         <Card title="Мой профиль" icon={User}>
             <div className="space-y-4 max-w-md">
@@ -1167,7 +1389,14 @@ const ProfileSection = ({ currentUser, setCurrentUser, setUsers, users }: any) =
                 <InputWrapper label="Email"><input disabled={!isEditing} className="w-full bg-white border border-slate-200 rounded-xl px-4 py-2 text-slate-900 font-bold disabled:bg-slate-50 outline-none" value={email} onChange={e => setEmail(e.target.value)} /></InputWrapper>
                 <InputWrapper label="Пароль"><input disabled={!isEditing} type="password" className="w-full bg-white border border-slate-200 rounded-xl px-4 py-2 text-slate-900 font-bold disabled:bg-slate-50 outline-none" value={pass} onChange={e => setPass(e.target.value)} /></InputWrapper>
                 <div className="flex gap-2 pt-2">
-                    {isEditing ? <><Button onClick={() => { setCurrentUser({...currentUser, nickname: nick, email, password: pass}); setUsers(users.map((u:any)=>u.id===currentUser.id?{...u, nickname: nick, email, password: pass}:u)); setIsEditing(false); }}>Ок</Button><Button variant="secondary" onClick={()=>setIsEditing(false)}>Отмена</Button></> : <Button onClick={()=>setIsEditing(true)}>Изменить</Button>}
+                    {isEditing ? (
+                        <>
+                            <Button onClick={handleSave}>Ок</Button>
+                            <Button variant="secondary" onClick={()=>setIsEditing(false)}>Отмена</Button>
+                        </>
+                    ) : (
+                        <Button onClick={()=>setIsEditing(true)}>Изменить</Button>
+                    )}
                 </div>
             </div>
         </Card>
@@ -1185,20 +1414,52 @@ const CategoriesSection = ({ categories, setCategories, locations, currentUser }
         return type === 'INCOME' ? DEFAULT_INCOME_CATEGORIES : DEFAULT_EXPENSE_CATEGORIES;
     }, [categories, targetLoc, type]);
 
-    const addCategory = () => {
+    const addCategory = async () => {
         if (!newCat) return;
         const current = categories[targetLoc] || { INCOME: [...DEFAULT_INCOME_CATEGORIES], EXPENSE: [...DEFAULT_EXPENSE_CATEGORIES] };
         if (current[type].includes(newCat)) return alert("Такая категория уже есть");
-        const updated = { ...categories, [targetLoc]: { ...current, [type]: [...current[type], newCat] } };
-        setCategories(updated);
+        
+        const updatedCategories = { 
+            ...categories, 
+            [targetLoc]: { 
+                ...current, 
+                [type]: [...current[type], newCat] 
+            } 
+        };
+        setCategories(updatedCategories);
+        
+        // Синхронизация добавления категории
+        await syncWithPusher('category-added', {
+            locationId: targetLoc,
+            type: type,
+            category: newCat,
+            allCategories: updatedCategories,
+            timestamp: Date.now()
+        });
+        
         setNewCat("");
     };
 
-    const removeCategory = (cat: string) => {
+    const removeCategory = async (cat: string) => {
         if (!confirm(`Удалить категорию "${cat}"?`)) return;
         const current = categories[targetLoc] || { INCOME: [...DEFAULT_INCOME_CATEGORIES], EXPENSE: [...DEFAULT_EXPENSE_CATEGORIES] };
-        const updated = { ...categories, [targetLoc]: { ...current, [type]: current[type].filter(c => c !== cat) } };
-        setCategories(updated);
+        const updatedCategories = { 
+            ...categories, 
+            [targetLoc]: { 
+                ...current, 
+                [type]: current[type].filter(c => c !== cat) 
+            } 
+        };
+        setCategories(updatedCategories);
+        
+        // Синхронизация удаления категории
+        await syncWithPusher('category-removed', {
+            locationId: targetLoc,
+            type: type,
+            category: cat,
+            allCategories: updatedCategories,
+            timestamp: Date.now()
+        });
     };
 
     return (
@@ -1239,12 +1500,81 @@ const LocationsSection = ({ locations, setLocations }: any) => {
     const [showModal, setShowModal] = useState(false);
     const [edit, setEdit] = useState<any>(null);
     const [val, setVal] = useState("");
+    
+    const handleSaveLocation = async () => {
+        if (!val) return;
+        
+        let updatedLocations;
+        if (edit) {
+            updatedLocations = locations.map((x: any) => 
+                x.id === edit.id ? {...x, name: val} : x
+            );
+        } else {
+            const newLocation = { id: Date.now().toString(), name: val };
+            updatedLocations = [...locations, newLocation];
+        }
+        
+        setLocations(updatedLocations);
+        setShowModal(false);
+        
+        // Синхронизация изменения локаций
+        await syncWithPusher(edit ? 'location-updated' : 'location-added', {
+            location: edit ? {id: edit.id, name: val} : {id: Date.now().toString(), name: val},
+            allLocations: updatedLocations,
+            timestamp: Date.now()
+        });
+    };
+    
+    const handleDeleteLocation = async (id: string) => {
+        const updatedLocations = locations.filter((x: any) => x.id !== id);
+        setLocations(updatedLocations);
+        
+        // Синхронизация удаления локации
+        await syncWithPusher('location-deleted', {
+            locationId: id,
+            allLocations: updatedLocations,
+            timestamp: Date.now()
+        });
+    };
+    
     return (
-        <Card title="Локации" icon={Building} extra={<Button onClick={()=>{setEdit(null);setVal("");setShowModal(true)}} icon={Plus}>Добавить</Button>}>
+        <Card title="Локации" icon={Building} extra={
+            <Button onClick={()=>{setEdit(null);setVal("");setShowModal(true)}} icon={Plus}>Добавить</Button>
+        }>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                {locations.map((l:any)=>(<div key={l.id} className="p-4 border border-slate-100 rounded-2xl flex items-center justify-between bg-white shadow-sm font-bold text-slate-800">{l.name}<div className="flex gap-1"><button onClick={()=>{setEdit(l);setVal(l.name);setShowModal(true)}} className="p-2 text-indigo-400 hover:text-indigo-600"><Pencil size={18}/></button><button onClick={()=>setLocations(locations.filter((x:any)=>x.id!==l.id))} className="p-2 text-rose-400 hover:text-rose-600"><Trash2 size={18}/></button></div></div>))}
+                {locations.map((l: any) => (
+                    <div key={l.id} className="p-4 border border-slate-100 rounded-2xl flex items-center justify-between bg-white shadow-sm font-bold text-slate-800">
+                        {l.name}
+                        <div className="flex gap-1">
+                            <button onClick={()=>{setEdit(l);setVal(l.name);setShowModal(true)}} className="p-2 text-indigo-400 hover:text-indigo-600">
+                                <Pencil size={18}/>
+                            </button>
+                            <button onClick={() => handleDeleteLocation(l.id)} className="p-2 text-rose-400 hover:text-rose-600">
+                                <Trash2 size={18}/>
+                            </button>
+                        </div>
+                    </div>
+                ))}
             </div>
-            {showModal && <div className="fixed inset-0 bg-slate-900/60 z-[120] flex items-center justify-center p-4"><Card title={edit?"Изменить филиал":"Новая локация"} className="w-full max-w-xs relative"><button onClick={()=>setShowModal(false)} className="absolute top-4 right-4 text-slate-400"><XIcon/></button><div className="space-y-4 pt-2"><input placeholder="Название..." className="w-full p-3 border rounded-xl bg-white text-slate-900 font-bold outline-none" value={val} onChange={e=>setVal(e.target.value)}/><div className="flex gap-2"><Button className="flex-1" onClick={()=>{if(!val) return; if(edit)setLocations(locations.map((x:any)=>x.id===edit.id?{...x,name:val}:x));else setLocations([...locations,{id:Date.now().toString(),name:val}]);setShowModal(false)}}>Ок</Button><Button variant="secondary" onClick={()=>setShowModal(false)}>Отмена</Button></div></div></Card></div>}
+            {showModal && (
+                <div className="fixed inset-0 bg-slate-900/60 z-[120] flex items-center justify-center p-4">
+                    <Card title={edit ? "Изменить филиал" : "Новая локация"} className="w-full max-w-xs relative">
+                        <button onClick={()=>setShowModal(false)} className="absolute top-4 right-4 text-slate-400"><XIcon/></button>
+                        <div className="space-y-4 pt-2">
+                            <input 
+                                placeholder="Название..." 
+                                className="w-full p-3 border rounded-xl bg-white text-slate-900 font-bold outline-none" 
+                                value={val} 
+                                onChange={e=>setVal(e.target.value)}
+                            />
+                            <div className="flex gap-2">
+                                <Button className="flex-1" onClick={handleSaveLocation}>Ок</Button>
+                                <Button variant="secondary" onClick={()=>setShowModal(false)}>Отмена</Button>
+                            </div>
+                        </div>
+                    </Card>
+                </div>
+            )}
         </Card>
     );
 };
@@ -1266,18 +1596,49 @@ const UsersSection = ({ users, setUsers, locations, currentUser }: any) => {
         setShow(true);
     };
 
-    const handleSave = () => {
+    const handleSave = async () => {
         if (!nu.nickname || !nu.email || !nu.password) {
             alert("Заполните обязательные поля");
             return;
         }
 
+        let updatedUsers;
         if (editId) {
-            setUsers(users.map((u: any) => u.id === editId ? { ...u, ...nu, locationIds: nu.locs } : u));
+            updatedUsers = users.map((u: any) => 
+                u.id === editId ? { ...u, ...nu, locationIds: nu.locs } : u
+            );
         } else {
-            setUsers([...users, { ...nu, id: Date.now().toString(), locationIds: nu.locs }]);
+            const newUser = { 
+                ...nu, 
+                id: Date.now().toString(), 
+                locationIds: nu.locs 
+            };
+            updatedUsers = [...users, newUser];
         }
+        
+        setUsers(updatedUsers);
         setShow(false);
+        
+        // Синхронизация изменения пользователей
+        await syncWithPusher(editId ? 'user-updated' : 'user-added', {
+            user: editId ? 
+                { id: editId, ...nu, locationIds: nu.locs } : 
+                { id: Date.now().toString(), ...nu, locationIds: nu.locs },
+            allUsers: updatedUsers,
+            timestamp: Date.now()
+        });
+    };
+
+    const handleDeleteUser = async (userId: string) => {
+        const updatedUsers = users.filter((x: any) => x.id !== userId);
+        setUsers(updatedUsers);
+        
+        // Синхронизация удаления пользователя
+        await syncWithPusher('user-deleted', {
+            userId: userId,
+            allUsers: updatedUsers,
+            timestamp: Date.now()
+        });
     };
 
     const toggleLoc = (id: string) => {
@@ -1290,7 +1651,7 @@ const UsersSection = ({ users, setUsers, locations, currentUser }: any) => {
     return (
         <Card title="Пользователи" icon={Users} extra={<Button onClick={handleOpenAdd} icon={UserPlus}>Добавить</Button>}>
             <div className="space-y-3">
-                {users.map((u:any)=>(
+                {users.map((u: any)=>(
                     <div key={u.id} className="flex items-center justify-between p-4 border border-slate-100 rounded-2xl bg-white shadow-sm">
                         <div className="flex-1 min-w-0 pr-4">
                             <p className="font-black text-slate-900 truncate">{u.nickname}</p>
@@ -1302,8 +1663,9 @@ const UsersSection = ({ users, setUsers, locations, currentUser }: any) => {
                             <button onClick={() => handleOpenEdit(u)} className="p-2 text-indigo-400 hover:text-indigo-600">
                                 <Pencil size={18}/>
                             </button>
+                            {/* Удалить может только основатель, и нельзя удалить самого себя */}
                             {currentUser.role === 'FOUNDER' && u.id !== currentUser.id && (
-                                <button onClick={() => setUsers(users.filter((x:any)=>x.id!==u.id))} className="p-2 text-rose-400 hover:text-rose-600">
+                                <button onClick={() => handleDeleteUser(u.id)} className="p-2 text-rose-400 hover:text-rose-600">
                                     <Trash2 size={18}/>
                                 </button>
                             )}
