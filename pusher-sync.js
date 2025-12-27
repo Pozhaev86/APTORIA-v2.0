@@ -1,7 +1,7 @@
 
 // pusher-sync.js
 const PUSHER_CONFIG = {
-  key: '015589369cb5ee673384',
+  key: 'dd8bccb765fe5fd9cffa',
   cluster: 'eu',
   forceTLS: true,
   authEndpoint: '/api/pusher-auth'
